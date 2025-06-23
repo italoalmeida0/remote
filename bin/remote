@@ -1,0 +1,1318 @@
+#!/bin/bash
+# Enhanced remote command with resume, compression, and verification
+# Requires: bash 4.0+ for proper array handling and advanced features
+# Note: Uses 'local' in for loops which requires GNU bash (not POSIX sh/dash)
+# macOS users: Default bash is 3.2, install newer with: brew install bash
+#              Then run with: /usr/local/bin/bash remote [args]
+
+# Exit on error, undefined variables, and pipe failures
+set -euo pipefail
+
+# Handle empty globs properly
+shopt -s nullglob
+
+# Ensure secure file permissions for all created files
+umask 077
+
+# Trap for cleanup
+CLEANUP_ITEMS=()
+cleanup() {
+    local item
+    for item in "${CLEANUP_ITEMS[@]}"; do
+        rm -rf "$item" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT
+
+REMOTE_DIR="$HOME/.remote-sessions"
+JOBS_DIR="$REMOTE_DIR/jobs"
+mkdir -p "$REMOTE_DIR" "$JOBS_DIR"
+
+# Ensure proper permissions
+chmod 700 "$REMOTE_DIR"
+chmod 700 "$JOBS_DIR" 2>/dev/null || true
+
+# Output control
+QUIET_MODE=false
+TRUST_HOST=false
+for arg in "$@"; do
+    case "$arg" in
+        --quiet) QUIET_MODE=true ;;
+        --trust-host) TRUST_HOST=true ;;
+    esac
+done
+
+# Apply quiet mode redirect for non-critical output
+# Note: We keep stderr visible for errors and some commands need stdout (exec, progress)
+if [ "$QUIET_MODE" = "true" ]; then
+    case "${1:-}" in
+        exec|progress|list|saved)
+            # These commands need output
+            ;;
+        *)
+            # Redirect only informational output
+            exec 3>&1 4>&2
+            exec 1>/dev/null
+            ;;
+    esac
+fi
+
+show_usage() {
+    echo "Usage:"
+    echo "  remote list                                    - List all active sessions"
+    echo "  remote open <id> [user@host]                  - Open SSH connection (uses saved creds if available)"
+    echo "  remote save <id> <user@host> <password>       - Save SSH credentials for easy reconnection"
+    echo "  remote saved                                   - List saved sessions"
+    echo "  remote forget <id>                            - Remove saved credentials"
+    echo "  remote exec <id> <command>                    - Execute command on remote host"
+    echo "  remote download <id> <remote-file> [local] [opts] - Download file from remote"
+    echo "  remote upload <id> <local-file> [remote] [opts]   - Upload file to remote"
+    echo "  remote transfer <from-id> <file> <to-id> <dest> [mode] [opts] - Transfer between remotes"
+    echo "  remote close <id>                             - Close SSH connection"
+    echo "  remote close-all                              - Close all SSH connections"
+    echo "  remote progress list                          - List all background jobs"
+    echo "  remote progress <job-id>                      - Check specific job progress"
+    echo "  remote progress clean                         - Clean old completed jobs"
+    echo ""
+    echo "Default behavior:"
+    echo "  - Resume is ENABLED by default (use --no-resume to disable)"
+    echo "  - Verification is ENABLED by default (use --no-verify to disable)"
+    echo "  - Compression is available with --compress"
+    echo ""
+    echo "Download/Upload options:"
+    echo "  --no-resume  - Disable resume (start from beginning)"
+    echo "  --no-verify  - Disable hash verification"
+    echo "  --compress   - Enable compression during transfer"
+    echo "  --quiet      - Reduce output verbosity"
+    echo "  --trust-host - Skip host key verification (DANGEROUS!)"
+    echo ""
+    echo "Transfer modes: proxy (default), direct, local"
+    echo ""
+    echo "Security note: Direct mode requires confirmation unless -y flag is used"
+    exit 1
+}
+
+# Check for required dependencies
+check_dependencies() {
+    local missing=()
+    
+    # Core dependencies
+    command -v ssh >/dev/null 2>&1 || missing+=("ssh")
+    command -v rsync >/dev/null 2>&1 || missing+=("rsync")
+    command -v openssl >/dev/null 2>&1 || missing+=("openssl")
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "Error: Missing required dependencies: ${missing[*]}"
+        echo "Please install them before using this tool."
+        exit 1
+    fi
+}
+
+# Platform detection
+PLATFORM="linux"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    PLATFORM="macos"
+elif [[ "$OSTYPE" == "freebsd"* ]] || [[ "$OSTYPE" == "bsd"* ]]; then
+    PLATFORM="bsd"
+fi
+
+# Platform-specific commands
+get_file_size() {
+    local file="$1"
+    case "$PLATFORM" in
+        macos|bsd)
+            stat -f%z "$file" 2>/dev/null || echo -1
+            ;;
+        *)
+            stat -c%s "$file" 2>/dev/null || echo -1
+            ;;
+    esac
+}
+
+get_hash_command() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        echo "sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        echo "shasum -a 256"
+    elif command -v openssl >/dev/null 2>&1; then
+        echo "openssl dgst -sha256 -r"
+    else
+        echo ""
+    fi
+}
+
+HASH_CMD=$(get_hash_command)
+
+# Check dependencies on first run
+check_dependencies
+
+get_session_info() {
+    local id="$1"
+    if [ ! -f "$REMOTE_DIR/$id.host" ] || [ ! -f "$REMOTE_DIR/$id.control" ]; then
+        echo "Error: Session '$id' not found. Use 'remote list' to see active sessions."
+        exit 1
+    fi
+    SSH_HOST=$(cat "$REMOTE_DIR/$id.host" 2>/dev/null || echo "")
+    CONTROL_PATH=$(cat "$REMOTE_DIR/$id.control" 2>/dev/null || echo "")
+    if [ -z "$SSH_HOST" ] || [ -z "$CONTROL_PATH" ]; then
+        echo "Error: Session '$id' configuration corrupted"
+        exit 1
+    fi
+}
+
+check_session_alive() {
+    local id="$1"
+    ssh -O check -o ControlPath="$CONTROL_PATH" "$SSH_HOST" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo "Error: Session [$id] is not active or has been disconnected."
+        echo "Removing stale session files..."
+        
+        # Clean up control directory if exists
+        if [ -f "$REMOTE_DIR/$id.controldir" ]; then
+            local control_dir=$(cat "$REMOTE_DIR/$id.controldir" 2>/dev/null)
+            [ -n "$control_dir" ] && rm -rf "$control_dir"
+        fi
+        
+        rm -f "$REMOTE_DIR/$id.host" "$REMOTE_DIR/$id.control" "$REMOTE_DIR/$id.controldir"
+        echo "Please run 'remote open $id <user@host>' to reconnect."
+        exit 1
+    fi
+}
+
+# Format bytes to human readable
+format_bytes() {
+    local bytes="${1:-0}"
+    if [ -z "$bytes" ] || ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        echo "0B"
+        return
+    fi
+    if [ "$bytes" -lt 1024 ]; then
+        echo "${bytes}B"
+    elif [ $bytes -lt 1048576 ]; then
+        echo "$((bytes/1024))KB"
+    elif [ $bytes -lt 1073741824 ]; then
+        echo "$((bytes/1048576))MB"
+    else
+        echo "$((bytes/1073741824))GB"
+    fi
+}
+
+# Validate session ID (alphanumeric, dash, underscore only)
+validate_id() {
+    local id="$1"
+    if ! [[ "$id" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "Error: Invalid ID '$id'. Use only letters, numbers, dash and underscore."
+        exit 1
+    fi
+    if [[ "$id" =~ \.\. ]]; then
+        echo "Error: ID cannot contain '..' for security reasons."
+        exit 1
+    fi
+}
+
+# Safely escape shell arguments
+shell_escape() {
+    printf '%q' "$1"
+}
+
+# Output with quiet mode support
+quiet_echo() {
+    if [ "$QUIET_MODE" != "true" ]; then
+        echo "$@"
+    fi
+}
+
+# Generate job ID (secure and unique)
+generate_job_id() {
+    local tmpfile
+    tmpfile=$(mktemp "$JOBS_DIR/job.XXXXXXXXXX")
+    local job_id
+    job_id=$(basename "$tmpfile")
+    rm -f "$tmpfile"
+    echo "$job_id"
+}
+
+# Start background job
+start_background_job() {
+    local job_id="$1"
+    local cmd_desc="$2"
+    local full_command="$3"
+    
+    # Clean up any existing job files with same ID (shouldn't happen with mktemp, but be safe)
+    for f in "$JOBS_DIR/$job_id."*; do
+        [ -f "$f" ] && rm -f "$f"
+    done
+    
+    # Create job files
+    echo "RUNNING" > "$JOBS_DIR/$job_id.status"
+    echo "0%" > "$JOBS_DIR/$job_id.progress"
+    echo "$cmd_desc" > "$JOBS_DIR/$job_id.cmd"
+    echo "$(date +%s)" > "$JOBS_DIR/$job_id.start"
+    
+    # Create wrapper script
+    local wrapper_script="$JOBS_DIR/$job_id.sh"
+    cat > "$wrapper_script" << EOF
+#!/bin/bash
+JOB_ID="\$1"
+JOBS_DIR="$JOBS_DIR"
+shift
+
+# Update status
+echo "RUNNING" > "\$JOBS_DIR/\$JOB_ID.status"
+
+# Execute command and capture output
+LOG_FILE="\$JOBS_DIR/\$JOB_ID.log"
+PROGRESS_FILE="\$JOBS_DIR/\$JOB_ID.progress"
+
+# Run the actual command
+bash -c "\$@" 2>&1 | while IFS= read -r line; do
+    echo "\$line" >> "\$LOG_FILE"
+    
+    # Extract progress if available (supports rsync 3.2.4+ format with decimals)
+    if [[ "\$line" =~ ([0-9]+(\.[0-9]+)?)% ]]; then
+        echo "\${BASH_REMATCH[1]}%" > "\$PROGRESS_FILE"
+    fi
+done
+
+# Get exit code
+EXIT_CODE="\${PIPESTATUS[0]}"
+
+# Update final status
+if [ "\$EXIT_CODE" -eq 0 ]; then
+    echo "COMPLETED" > "\$JOBS_DIR/\$JOB_ID.status"
+    echo "100%" > "\$PROGRESS_FILE"
+else
+    echo "FAILED" > "\$JOBS_DIR/\$JOB_ID.status"
+fi
+
+echo "\$EXIT_CODE" > "\$JOBS_DIR/\$JOB_ID.exitcode"
+echo "\$(date +%s)" > "\$JOBS_DIR/\$JOB_ID.end"
+
+# Cleanup
+rm -f "\$JOBS_DIR/\$JOB_ID.sh"
+EOF
+    
+    chmod 700 "$wrapper_script"
+    
+    # Set restrictive permissions on job files
+    for f in "$JOBS_DIR/$job_id."*; do
+        [ -f "$f" ] && chmod 600 "$f"
+    done
+    
+    # Launch completely detached
+    nohup bash "$wrapper_script" "$job_id" "$full_command" </dev/null >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid" > "$JOBS_DIR/$job_id.pid"
+    disown $pid
+    
+    echo ""
+    echo "Transfer started in background"
+    echo "Job ID: $job_id"
+    echo "To check progress: remote progress $job_id"
+    echo "To list all jobs: remote progress list"
+}
+
+# Show job progress
+show_job_progress() {
+    local job_id="$1"
+    
+    if [ ! -f "$JOBS_DIR/$job_id.status" ]; then
+        echo "Error: Job $job_id not found"
+        return 1
+    fi
+    
+    local status=$(cat "$JOBS_DIR/$job_id.status" 2>/dev/null || echo "UNKNOWN")
+    local progress=$(cat "$JOBS_DIR/$job_id.progress" 2>/dev/null || echo "0%")
+    local cmd=$(cat "$JOBS_DIR/$job_id.cmd" 2>/dev/null || echo "Unknown command")
+    local pid=$(cat "$JOBS_DIR/$job_id.pid" 2>/dev/null || echo "")
+    
+    echo "Job: $job_id"
+    echo "Status: $status"
+    echo "Progress: $progress"
+    echo "Command: $cmd"
+    
+    if [ "$status" = "RUNNING" ] && [ -n "$pid" ]; then
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "PID: $pid (active)"
+            
+            # Show last few lines of log if available
+            if [ -f "$JOBS_DIR/$job_id.log" ]; then
+                echo ""
+                echo "Recent activity:"
+                tail -3 "$JOBS_DIR/$job_id.log" | sed 's/^/  /'
+            fi
+        else
+            echo "PID: $pid (dead - job may have crashed)"
+            echo "CRASHED" > "$JOBS_DIR/$job_id.status"
+        fi
+    fi
+    
+    if [ "$status" = "COMPLETED" ] || [ "$status" = "FAILED" ]; then
+        local start_time=$(cat "$JOBS_DIR/$job_id.start" 2>/dev/null || echo "0")
+        local end_time=$(cat "$JOBS_DIR/$job_id.end" 2>/dev/null || echo "0")
+        local duration=$((end_time - start_time))
+        echo "Duration: ${duration}s"
+        
+        if [ "$status" = "FAILED" ]; then
+            local exit_code=$(cat "$JOBS_DIR/$job_id.exitcode" 2>/dev/null || echo "unknown")
+            echo "Exit code: $exit_code"
+        fi
+    fi
+}
+
+# List all jobs
+list_jobs() {
+    echo "ID              Status      Progress  Command"
+    echo "------------------------------------------------"
+    
+    for job_file in "$JOBS_DIR"/*.status; do
+        if [ -f "$job_file" ]; then
+            local job_id=$(basename "$job_file" .status)
+            local status=$(cat "$job_file" 2>/dev/null || echo "UNKNOWN")
+            local progress=$(cat "$JOBS_DIR/$job_id.progress" 2>/dev/null || echo "0%")
+            local cmd=$(cat "$JOBS_DIR/$job_id.cmd" 2>/dev/null || echo "Unknown")
+            
+            # Truncate command if too long
+            if [ ${#cmd} -gt 40 ]; then
+                cmd="${cmd:0:37}..."
+            fi
+            
+            printf "%-15s %-11s %-9s %s\n" "$job_id" "$status" "$progress" "$cmd"
+        fi
+    done
+    
+    local found_jobs=false
+    for job_file in "$JOBS_DIR"/*.status; do
+        if [ -f "$job_file" ]; then
+            found_jobs=true
+            break
+        fi
+    done
+    if [ "$found_jobs" = "false" ]; then
+        echo "No jobs found"
+    fi
+}
+
+# Clean old jobs
+clean_jobs() {
+    local cleaned=0
+    local now=$(date +%s)
+    local max_age=$((24 * 3600))  # 24 hours
+    
+    for job_file in "$JOBS_DIR"/*.status; do
+        if [ -f "$job_file" ]; then
+            local job_id=$(basename "$job_file" .status)
+            local status=$(cat "$job_file" 2>/dev/null)
+            
+            if [ "$status" = "COMPLETED" ] || [ "$status" = "FAILED" ]; then
+                local end_time=$(cat "$JOBS_DIR/$job_id.end" 2>/dev/null || echo "0")
+                local age=$((now - end_time))
+                
+                if [ $age -gt $max_age ]; then
+                    rm -f "$JOBS_DIR/$job_id".*
+                    ((cleaned++))
+                fi
+            fi
+        fi
+    done
+    
+    echo "Cleaned $cleaned old jobs"
+}
+
+# Get hash command for remote host
+get_remote_hash_command() {
+    local control_path="$1"
+    local host="$2"
+    
+    # Try commands in order of preference
+    local cmd
+    for cmd in "sha256sum" "shasum -a 256" "openssl dgst -sha256 -r"; do
+        if ssh -o ControlPath="$control_path" "$host" "command -v ${cmd%% *}" >/dev/null 2>&1; then
+            echo "$cmd"
+            return 0
+        fi
+    done
+    
+    echo ""
+    return 1
+}
+
+# Calculate file hash
+calculate_hash() {
+    local file="$1"
+    local is_remote="$2"
+    local control_path="$3"
+    local host="$4"
+    
+    local escaped_file
+    escaped_file=$(shell_escape "$file")
+    
+    if [ "$is_remote" = "true" ]; then
+        # Get appropriate hash command for remote host
+        local remote_hash_cmd
+        remote_hash_cmd=$(get_remote_hash_command "$control_path" "$host")
+        if [ -z "$remote_hash_cmd" ]; then
+            echo "Error: No hash command available on remote host" >&2
+            return 1
+        fi
+        # Execute hash command on remote - split command into array for proper word splitting
+        IFS=' ' read -r -a _cmd <<< "$remote_hash_cmd"
+        ssh -o ControlPath="$control_path" "$host" \
+            "${_cmd[@]}" "$file" 2>/dev/null | cut -d' ' -f1
+    else
+        if [ -z "$HASH_CMD" ]; then
+            echo "Error: No hash command available locally" >&2
+            return 1
+        fi
+        $HASH_CMD "$file" 2>/dev/null | cut -d' ' -f1
+    fi
+}
+
+# Encrypt password using openssl with PBKDF2
+encrypt_password() {
+    local password="$1"
+    local session_id="$2"
+    local salt_file="$REMOTE_DIR/.salt"
+    
+    # Generate or read salt
+    if [ ! -f "$salt_file" ]; then
+        if ! openssl rand -hex 32 > "$salt_file"; then
+            echo "Error: Failed to generate salt" >&2
+            return 1
+        fi
+        chmod 600 "$salt_file"
+    fi
+    local salt
+    salt=$(cat "$salt_file") || { echo "Error: Failed to read salt" >&2; return 1; }
+    
+    # Use PBKDF2 with high iteration count (600k for ~1s on modern CPU)
+    echo "$password" | openssl enc -aes-256-cbc -a -salt -pbkdf2 -iter 600000 \
+        -pass "pass:${salt}${session_id}" 2>/dev/null
+}
+
+# Decrypt password using openssl with PBKDF2
+decrypt_password() {
+    local encrypted="$1"
+    local session_id="$2"
+    local salt_file="$REMOTE_DIR/.salt"
+    
+    if [ ! -f "$salt_file" ]; then
+        echo "Error: Salt file not found" >&2
+        return 1
+    fi
+    local salt=$(cat "$salt_file")
+    
+    echo "$encrypted" | openssl enc -aes-256-cbc -d -a -pbkdf2 -iter 600000 \
+        -pass "pass:${salt}${session_id}" 2>/dev/null
+}
+
+# Check if sshpass is installed
+check_sshpass() {
+    if ! command -v sshpass >/dev/null 2>&1; then
+        echo "Error: sshpass is required for saved sessions. Install it with:"
+        echo "  sudo apt-get install sshpass  # Debian/Ubuntu"
+        echo "  sudo yum install sshpass      # RHEL/CentOS"
+        echo "  brew install hudochenkov/sshpass/sshpass  # macOS"
+        return 1
+    fi
+    return 0
+}
+
+# Enhanced download with resume, compression, and verification
+download_enhanced() {
+    local control_path="$1"
+    local host="$2"
+    local remote_file="$3"
+    local local_file="$4"
+    local session_id="$5"
+    shift 5
+    
+    # Default: resume and verify are ON
+    local use_resume=true
+    local use_compress=false
+    local use_verify=true
+    
+    # Parse options
+    while [ $# -gt 0 ]; do
+        case "${1:-}" in
+            --no-resume) use_resume=false ;;
+            --no-verify) use_verify=false ;;
+            --compress) use_compress=true ;;
+            --resume) use_resume=true ;;  # Keep for backward compatibility
+            --verify) use_verify=true ;;  # Keep for backward compatibility
+            --quiet) QUIET_MODE=true ;;
+        esac
+        shift
+    done
+    
+    # Check remote file size (with proper escaping)
+    local escaped_file
+    escaped_file=$(shell_escape "$remote_file")
+    # Get remote file size using platform-appropriate command
+    local stat_cmd="stat -c%s"
+    if ssh -o ControlPath="$control_path" "$host" "uname -s" 2>/dev/null | grep -q "Darwin"; then
+        stat_cmd="stat -f%z"
+    fi
+    local size=$(ssh -o ControlPath="$control_path" "$host" "$stat_cmd $escaped_file 2>/dev/null || echo -1")
+    if [ -z "$size" ] || [ "$size" = "-1" ]; then
+        echo "[ERROR] Remote file not found: $remote_file"
+        return 1
+    fi
+    
+    quiet_echo "File size: $(format_bytes $size)"
+    
+    # Build rsync options - always use rsync for resume capability
+    local rsync_opts="-avz --info=progress2"
+    if [ "$use_resume" = "true" ]; then
+        rsync_opts="$rsync_opts --partial --append-verify"
+    else
+        quiet_echo "[WARNING] Resume disabled - transfer will start from beginning"
+    fi
+    if [ "$use_compress" = "true" ]; then
+        rsync_opts="$rsync_opts --compress-level=9"
+        quiet_echo "[COMPRESS] Using maximum compression"
+    fi
+    
+    # Create job and run in background
+    local job_id=$(generate_job_id)
+    local cmd_desc="download [$session_id] $remote_file"
+    
+    # Build full command with proper escaping
+    local escaped_remote
+    escaped_remote=$(shell_escape "$remote_file")
+    local escaped_local
+    escaped_local=$(shell_escape "$local_file")
+    local full_cmd="rsync $rsync_opts --protect-args -e \"ssh -o ControlPath=$control_path\" \"$host:$escaped_remote\" \"$escaped_local\""
+    
+    # Add verification if needed
+    if [ "$use_verify" = "true" ]; then
+        if [ -z "$HASH_CMD" ]; then
+            echo "Error: No hash command available locally" >&2
+            return 1
+        fi
+        full_cmd="$full_cmd && echo '[VERIFY] Calculating hashes...' && "
+        full_cmd="$full_cmd REMOTE_HASH_CMD=\$(ssh -o ControlPath=\"$control_path\" \"$host\" 'command -v sha256sum >/dev/null 2>&1 && echo sha256sum || (command -v shasum >/dev/null 2>&1 && echo \"shasum -a 256\" || echo \"openssl dgst -sha256 -r\")') && "
+        full_cmd="$full_cmd remote_hash=\$(ssh -o ControlPath=\"$control_path\" \"$host\" \"\\\$REMOTE_HASH_CMD $escaped_remote\" 2>/dev/null | cut -d' ' -f1) && "
+        full_cmd="$full_cmd local_hash=\$($HASH_CMD \"$local_file\" 2>/dev/null | cut -d' ' -f1) && "
+        full_cmd="$full_cmd if [ \"\$remote_hash\" = \"\$local_hash\" ]; then echo '[VERIFY] OK - Hashes match'; else echo '[VERIFY] ERROR - Hash mismatch!' && exit 1; fi"
+    fi
+    
+    # Start background job
+    export JOBS_DIR  # Make it available to the wrapper script
+    start_background_job "$job_id" "$cmd_desc" "$full_cmd"
+    
+    return 0
+}
+
+# Enhanced upload with resume, compression, and verification
+upload_enhanced() {
+    local control_path="$1"
+    local host="$2"
+    local local_file="$3"
+    local remote_dest="$4"
+    local session_id="$5"
+    shift 5
+    
+    # Default: resume and verify are ON
+    local use_resume=true
+    local use_compress=false
+    local use_verify=true
+    
+    # Parse options
+    while [ $# -gt 0 ]; do
+        case "${1:-}" in
+            --no-resume) use_resume=false ;;
+            --no-verify) use_verify=false ;;
+            --compress) use_compress=true ;;
+            --resume) use_resume=true ;;  # Keep for backward compatibility
+            --verify) use_verify=true ;;  # Keep for backward compatibility
+            --quiet) QUIET_MODE=true ;;
+        esac
+        shift
+    done
+    
+    if [ ! -f "$local_file" ]; then
+        echo "[ERROR] Local file not found: $local_file"
+        return 1
+    fi
+    
+    local size=$(get_file_size "$local_file")
+    quiet_echo "File size: $(format_bytes $size)"
+    
+    # Build rsync options - always use rsync for resume capability
+    local rsync_opts="-avz --info=progress2"
+    if [ "$use_resume" = "true" ]; then
+        rsync_opts="$rsync_opts --partial --append-verify"
+    else
+        quiet_echo "[WARNING] Resume disabled - transfer will start from beginning"
+    fi
+    if [ "$use_compress" = "true" ]; then
+        rsync_opts="$rsync_opts --compress-level=9"
+        quiet_echo "[COMPRESS] Using maximum compression"
+    fi
+    
+    # Create job and run in background
+    local job_id=$(generate_job_id)
+    local cmd_desc="upload [$session_id] $local_file"
+    
+    # Build full command with proper escaping
+    local escaped_local
+    escaped_local=$(shell_escape "$local_file")
+    local escaped_remote
+    escaped_remote=$(shell_escape "$remote_dest")
+    local full_cmd="rsync $rsync_opts --protect-args -e \"ssh -o ControlPath=$control_path\" \"$escaped_local\" \"$host:$escaped_remote\""
+    
+    # Add verification if needed
+    if [ "$use_verify" = "true" ]; then
+        if [ -z "$HASH_CMD" ]; then
+            echo "Error: No hash command available locally" >&2
+            return 1
+        fi
+        full_cmd="$full_cmd && echo '[VERIFY] Calculating hashes...' && "
+        full_cmd="$full_cmd local_hash=\$($HASH_CMD \"$local_file\" 2>/dev/null | cut -d' ' -f1) && "
+        full_cmd="$full_cmd REMOTE_HASH_CMD=\$(ssh -o ControlPath=\"$control_path\" \"$host\" 'command -v sha256sum >/dev/null 2>&1 && echo sha256sum || (command -v shasum >/dev/null 2>&1 && echo \"shasum -a 256\" || echo \"openssl dgst -sha256 -r\")') && "
+        full_cmd="$full_cmd remote_hash=\$(ssh -o ControlPath=\"$control_path\" \"$host\" \"\\\$REMOTE_HASH_CMD $escaped_remote\" 2>/dev/null | cut -d' ' -f1) && "
+        full_cmd="$full_cmd if [ \"\$local_hash\" = \"\$remote_hash\" ]; then echo '[VERIFY] OK - Hashes match'; else echo '[VERIFY] ERROR - Hash mismatch!' && exit 1; fi"
+    fi
+    
+    # Start background job
+    export JOBS_DIR  # Make it available to the wrapper script
+    start_background_job "$job_id" "$cmd_desc" "$full_cmd"
+    
+    return 0
+}
+
+case "${1:-}" in
+    "list")
+        echo "Active sessions:"
+        found=0
+        for session in "$REMOTE_DIR"/*.host; do
+            if [ -f "$session" ]; then
+                found=1
+                id=$(basename "$session" .host)
+                host=$(cat "$session")
+                control=$(cat "$REMOTE_DIR/$id.control" 2>/dev/null)
+                
+                if [ -n "$control" ]; then
+                    ssh -O check -o ControlPath="$control" "$host" 2>/dev/null
+                    if [ $? -eq 0 ]; then
+                        echo "  [$id] -> $host (active)"
+                    else
+                        echo "  [$id] -> $host (disconnected)"
+                    fi
+                else
+                    echo "  [$id] -> $host (no control path)"
+                fi
+            fi
+        done
+        if [ $found -eq 0 ]; then
+            echo "  No active sessions"
+        fi
+        ;;
+        
+    "open")
+        ID="$2"
+        validate_id "$ID"
+        
+        # Check if session has saved credentials
+        if [ -f "$REMOTE_DIR/$ID.creds" ]; then
+            # Use saved credentials
+            CREDS=$(cat "$REMOTE_DIR/$ID.creds")
+            SSH_HOST=$(echo "$CREDS" | head -1)
+            ENCRYPTED_PASS=$(echo "$CREDS" | tail -1)
+            
+            quiet_echo "[INFO] Found saved credentials for session [$ID]"
+            
+            # Check if session is already active
+            if [ -f "$REMOTE_DIR/$ID.host" ] && [ -f "$REMOTE_DIR/$ID.control" ]; then
+                CONTROL_PATH=$(cat "$REMOTE_DIR/$ID.control")
+                ssh -O check -o ControlPath="$CONTROL_PATH" "$SSH_HOST" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    quiet_echo "[INFO] Session [$ID] is already active"
+                    exit 0
+                else
+                    quiet_echo "[INFO] Closing stale session [$ID]..."
+                    rm -f "$REMOTE_DIR/$ID.host" "$REMOTE_DIR/$ID.control"
+                fi
+            fi
+            
+            # Check sshpass
+            if ! check_sshpass; then
+                exit 1
+            fi
+            
+            # Decrypt password
+            PASSWORD=$(decrypt_password "$ENCRYPTED_PASS" "$ID")
+            
+            # Create secure control directory
+            CONTROL_DIR=$(mktemp -d "$REMOTE_DIR/control-XXXXXX")
+            chmod 700 "$CONTROL_DIR"
+            CONTROL_PATH="$CONTROL_DIR/%C"
+            ssh -O exit -o ControlPath="$CONTROL_PATH" "$SSH_HOST" 2>/dev/null
+            
+            quiet_echo "Opening SSH session [$ID] to $SSH_HOST using saved credentials..."
+            
+            # Build SSH options
+            ssh_opts="-M -f -N"
+            ssh_opts="$ssh_opts -o ControlPath=$CONTROL_PATH"
+            ssh_opts="$ssh_opts -o ControlPersist=yes"
+            ssh_opts="$ssh_opts -o ConnectTimeout=60"
+            ssh_opts="$ssh_opts -o ServerAliveInterval=15"
+            ssh_opts="$ssh_opts -o ServerAliveCountMax=3"
+            ssh_opts="$ssh_opts -o TCPKeepAlive=yes"
+            ssh_opts="$ssh_opts -o LogLevel=ERROR"
+            
+            # Only skip host verification if explicitly requested
+            if [ "$TRUST_HOST" = "true" ]; then
+                quiet_echo "[WARNING] Skipping host key verification (--trust-host)"
+                ssh_opts="$ssh_opts -o StrictHostKeyChecking=no"
+                ssh_opts="$ssh_opts -o UserKnownHostsFile=/dev/null"
+            fi
+            
+            # Use sshpass to connect (with environment variable for security)
+            SSHPASS="$PASSWORD" sshpass -e ssh $ssh_opts "$SSH_HOST"
+            
+            if [ $? -eq 0 ]; then
+                echo "$SSH_HOST" > "$REMOTE_DIR/$ID.host"
+                echo "$CONTROL_PATH" > "$REMOTE_DIR/$ID.control"
+                echo "$CONTROL_DIR" > "$REMOTE_DIR/$ID.controldir"
+                echo "[OK] Session [$ID] opened to $SSH_HOST"
+            else
+                echo "[ERROR] Failed to open session with saved credentials"
+                echo "Use 'remote forget $ID' to remove saved credentials"
+                exit 1
+            fi
+        else
+            # Normal open without saved credentials
+            if [ $# -lt 3 ]; then
+                echo "Usage: remote open <id> <user@host>"
+                echo "  or: remote save <id> <user@host> <password>  # to save credentials"
+                exit 1
+            fi
+            SSH_HOST="$3"
+            # Create secure control directory
+            CONTROL_DIR=$(mktemp -d "$REMOTE_DIR/control-XXXXXX")
+            chmod 700 "$CONTROL_DIR"
+            CONTROL_PATH="$CONTROL_DIR/%C"
+            
+            if [ -f "$REMOTE_DIR/$ID.host" ]; then
+                echo "Error: Session ID '$ID' already exists. Choose a different ID."
+                exit 1
+            fi
+            
+            ssh -O exit -o ControlPath="$CONTROL_PATH" "$SSH_HOST" 2>/dev/null
+            
+            quiet_echo "Opening SSH session [$ID] to $SSH_HOST..."
+            quiet_echo "Using extended timeouts for slow connections..."
+            
+            # Build SSH options
+            ssh_opts="-M -f -N"
+            ssh_opts="$ssh_opts -o ControlPath=$CONTROL_PATH"
+            ssh_opts="$ssh_opts -o ControlPersist=yes"
+            ssh_opts="$ssh_opts -o ConnectTimeout=60"
+            ssh_opts="$ssh_opts -o ServerAliveInterval=15"
+            ssh_opts="$ssh_opts -o ServerAliveCountMax=3"
+            ssh_opts="$ssh_opts -o TCPKeepAlive=yes"
+            ssh_opts="$ssh_opts -o LogLevel=ERROR"
+            
+            # Only skip host verification if explicitly requested
+            if [ "$TRUST_HOST" = "true" ]; then
+                quiet_echo "[WARNING] Skipping host key verification (--trust-host)"
+                ssh_opts="$ssh_opts -o StrictHostKeyChecking=no"
+                ssh_opts="$ssh_opts -o UserKnownHostsFile=/dev/null"
+            fi
+            
+            # Enhanced SSH connection
+            ssh $ssh_opts "$SSH_HOST"
+            
+            if [ $? -eq 0 ]; then
+                echo "$SSH_HOST" > "$REMOTE_DIR/$ID.host"
+                echo "$CONTROL_PATH" > "$REMOTE_DIR/$ID.control"
+                echo "$CONTROL_DIR" > "$REMOTE_DIR/$ID.controldir"
+                echo "[OK] Session [$ID] opened to $SSH_HOST"
+            else
+                echo "[ERROR] Failed to open session"
+                echo "Possible causes:"
+                echo "  - SSH server is slow to respond"
+                echo "  - Network connectivity issues"
+                echo "  - Authentication problems"
+                echo ""
+                echo "Try running: ssh -v $SSH_HOST"
+                exit 1
+            fi
+        fi
+        ;;
+        
+    "exec")
+        if [ $# -lt 3 ]; then
+            echo "Usage: remote exec <id> <command>"
+            exit 1
+        fi
+        ID="$2"
+        validate_id "$ID"
+        shift 2
+        get_session_info "$ID"
+        check_session_alive "$ID"
+        
+        ssh -o ControlPath="$CONTROL_PATH" "$SSH_HOST" "$@"
+        ;;
+        
+    "download")
+        if [ $# -lt 3 ]; then
+            echo "Usage: remote download <id> <remote-file> [local-destination] [options]"
+            echo "Options: --no-resume, --no-verify, --compress"
+            echo "Note: Resume and verification are enabled by default"
+            exit 1
+        fi
+        ID="$2"
+        validate_id "$ID"
+        REMOTE_FILE="$3"
+        LOCAL_FILE="${4:-.}"
+        
+        # If 4th argument starts with --, it's an option, use default local file
+        if [[ "${4:-}" == --* ]]; then
+            LOCAL_FILE="."
+            shift 3
+        else
+            shift 4  # Shift only up to the options
+        fi
+        
+        get_session_info "$ID"
+        check_session_alive "$ID"
+        
+        if [ "$LOCAL_FILE" = "." ]; then
+            LOCAL_FILE=$(basename "$REMOTE_FILE")
+        fi
+        
+        echo "Downloading: [$ID]$SSH_HOST:$REMOTE_FILE -> $LOCAL_FILE"
+        download_enhanced "$CONTROL_PATH" "$SSH_HOST" "$REMOTE_FILE" "$LOCAL_FILE" "$ID" "$@"
+        ;;
+        
+    "upload")
+        if [ $# -lt 3 ]; then
+            echo "Usage: remote upload <id> <local-file> [remote-destination] [options]"
+            echo "Options: --no-resume, --no-verify, --compress"
+            echo "Note: Resume and verification are enabled by default"
+            exit 1
+        fi
+        ID="$2"
+        validate_id "$ID"
+        LOCAL_FILE="$3"
+        REMOTE_DEST="${4:-.}"
+        
+        # If 4th argument starts with --, it's an option, use default remote dest
+        if [[ "${4:-}" == --* ]]; then
+            REMOTE_DEST="."
+            shift 3
+        else
+            shift 4  # Shift only up to the options
+        fi
+        
+        get_session_info "$ID"
+        check_session_alive "$ID"
+        
+        echo "Uploading: $LOCAL_FILE -> [$ID]$SSH_HOST:$REMOTE_DEST"
+        upload_enhanced "$CONTROL_PATH" "$SSH_HOST" "$LOCAL_FILE" "$REMOTE_DEST" "$ID" "$@"
+        ;;
+        
+    "transfer")
+        if [ $# -lt 5 ]; then
+            echo "Usage: remote transfer <from-id> <file> <to-id> <destination> [mode] [options]"
+            echo "Modes: proxy (stream through local), direct (temporary SSH key), local (download then upload)"
+            echo "Options: --compress, --no-verify, -y (skip confirmation)"
+            echo "Note: Verification is enabled by default"
+            exit 1
+        fi
+        FROM_ID="$2"
+        validate_id "$FROM_ID"
+        FILE="$3"
+        TO_ID="$4"
+        validate_id "$TO_ID"
+        DEST="$5"
+        MODE="${6:-proxy}"
+        
+        # Parse mode and options
+        shift 5
+        if [ $# -gt 0 ] && [[ "$1" != --* ]] && [[ "$1" != -* ]]; then
+            MODE="$1"
+            shift
+        fi
+        
+        # Get source session info
+        if [ ! -f "$REMOTE_DIR/$FROM_ID.host" ] || [ ! -f "$REMOTE_DIR/$FROM_ID.control" ]; then
+            echo "Error: Source session '$FROM_ID' not found"
+            exit 1
+        fi
+        FROM_HOST=$(cat "$REMOTE_DIR/$FROM_ID.host")
+        FROM_CONTROL=$(cat "$REMOTE_DIR/$FROM_ID.control")
+        
+        # Get destination session info
+        if [ ! -f "$REMOTE_DIR/$TO_ID.host" ] || [ ! -f "$REMOTE_DIR/$TO_ID.control" ]; then
+            echo "Error: Destination session '$TO_ID' not found"
+            exit 1
+        fi
+        TO_HOST=$(cat "$REMOTE_DIR/$TO_ID.host")
+        TO_CONTROL=$(cat "$REMOTE_DIR/$TO_ID.control")
+        
+        echo "Transferring: [$FROM_ID]$FROM_HOST:$FILE -> [$TO_ID]$TO_HOST:$DEST"
+        echo "Mode: $MODE"
+        
+        # Parse transfer options - verify is ON by default
+        use_compress=false
+        use_verify=true
+        skip_confirm=false
+        while [ $# -gt 0 ]; do
+            case "${1:-}" in
+                --compress) use_compress=true ;;
+                --no-verify) use_verify=false ;;
+                --verify) use_verify=true ;;  # Keep for backward compatibility
+                -y) skip_confirm=true ;;
+            esac
+            shift
+        done
+        
+        case "$MODE" in
+            "proxy")
+                echo "[PROXY MODE] Streaming through local machine..."
+                # Get file size with platform detection
+                ESCAPED_FILE=$(shell_escape "$FILE")
+                STAT_CMD="stat -c%s"
+                if ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "uname -s" 2>/dev/null | grep -q "Darwin"; then
+                    STAT_CMD="stat -f%z"
+                fi
+                SIZE=$(ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "$STAT_CMD $ESCAPED_FILE 2>/dev/null || echo 0")
+                if [ "$SIZE" -gt 0 ]; then
+                    echo "File size: $(format_bytes $SIZE)"
+                fi
+                
+                if [ "$use_compress" = "true" ]; then
+                    quiet_echo "[COMPRESS] Using gzip compression"
+                    ESCAPED_FILE_CMD=$(shell_escape "$FILE")
+                    ESCAPED_DEST_CMD=$(shell_escape "$DEST")
+                    ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "gzip -c -- $ESCAPED_FILE_CMD" | \
+                    ssh -o ControlPath="$TO_CONTROL" "$TO_HOST" "gunzip -c > $ESCAPED_DEST_CMD"
+                elif command -v pv >/dev/null 2>&1 && [ "$SIZE" -gt 0 ]; then
+                    ESCAPED_FILE_CMD=$(shell_escape "$FILE")
+                    ESCAPED_DEST_CMD=$(shell_escape "$DEST")
+                    ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "cat -- $ESCAPED_FILE_CMD" | \
+                    pv -s "$SIZE" | \
+                    ssh -o ControlPath="$TO_CONTROL" "$TO_HOST" "cat > $ESCAPED_DEST_CMD"
+                else
+                    ESCAPED_FILE_CMD=$(shell_escape "$FILE")
+                    ESCAPED_DEST_CMD=$(shell_escape "$DEST")
+                    ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "cat -- $ESCAPED_FILE_CMD" | \
+                    ssh -o ControlPath="$TO_CONTROL" "$TO_HOST" "cat > $ESCAPED_DEST_CMD"
+                fi
+                
+                RESULT=$?
+                ;;
+                
+            "direct")
+                # Security warning for direct mode
+                if [ "$skip_confirm" != "true" ]; then
+                    echo ""
+                    echo "⚠️  WARNING: Direct mode security considerations:"
+                    echo "   - Temporary SSH key will be created on source server"
+                    echo "   - If transfer is interrupted, key may remain on source server"
+                    echo "   - Source server will have temporary access to destination"
+                    echo "   - NOT RECOMMENDED when source server is untrusted"
+                    echo ""
+                    echo -n "Continue with direct mode? (y/N): "
+                    read -r response
+                    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+                        echo "Switching to proxy mode for safety..."
+                        MODE="proxy"
+                    fi
+                fi
+                
+                if [ "$MODE" = "direct" ]; then
+                    echo "[DIRECT MODE] Setting up temporary direct connection..."
+                    TEMP_KEY=$(mktemp "$REMOTE_DIR/key-XXXXXX")
+                    CLEANUP_ITEMS+=("$TEMP_KEY" "$TEMP_KEY.pub")
+                    TIMESTAMP=$(date +%s)
+                    KEY_COMMENT="TEMP-TRANSFER-KEY-$$-$TIMESTAMP"
+                    
+                    # Generate key with comment for easy identification
+                    ssh-keygen -t ed25519 -f "$TEMP_KEY" -N "" -C "$KEY_COMMENT" -q
+                    
+                    # Get IPs for restrictions
+                    FROM_IP=$(ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "hostname -I | awk '{print \$1}'")
+                    TO_IP=$(ssh -o ControlPath="$TO_CONTROL" "$TO_HOST" "hostname -I | awk '{print \$1}'")
+                    
+                    # Add key with maximum restrictions (check for duplicates first)
+                    TEMP_KEY_PUB=$(cat "$TEMP_KEY.pub")
+                    ESCAPED_DEST=$(shell_escape "$DEST")
+                    # Use restrict option if available (OpenSSH 7.4+), otherwise use individual restrictions
+                    ssh -o ControlPath="$TO_CONTROL" "$TO_HOST" "mkdir -p ~/.ssh && (
+                        # Check if key already exists to prevent duplicates
+                        if ! grep -qF '$KEY_COMMENT' ~/.ssh/authorized_keys 2>/dev/null; then
+                            if ssh -V 2>&1 | grep -q 'OpenSSH_[789]'; then
+                                echo 'from=\"$FROM_IP\",restrict,command=\"rsync --server --sender -vlogDtpre.iLsfxC --numeric-ids . $ESCAPED_DEST\" $TEMP_KEY_PUB'
+                            else
+                                echo 'from=\"$FROM_IP\",command=\"rsync --server --sender -vlogDtpre.iLsfxC --numeric-ids . $ESCAPED_DEST\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $TEMP_KEY_PUB'
+                            fi
+                        fi
+                    ) >> ~/.ssh/authorized_keys"
+                    
+                    # Copy key to source with auto-cleanup script
+                    scp -q -o ControlPath="$FROM_CONTROL" "$TEMP_KEY" "$FROM_HOST:/tmp/transfer-key-$$"
+                    
+                    # Create auto-cleanup script on source
+                    ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "cat > /tmp/cleanup-transfer-key-$$.sh << 'CLEANUP_EOF'
+#!/bin/bash
+# Auto-cleanup after 10 minutes or when transfer completes
+sleep 600 &
+CLEANUP_PID=\$!
+
+# Wait for rsync to complete
+while pgrep -f 'rsync.*transfer-key-$$' > /dev/null; do
+    sleep 2
+done
+
+kill \$CLEANUP_PID 2>/dev/null
+
+# Clean up
+rm -f /tmp/transfer-key-$$
+rm -f /tmp/cleanup-transfer-key-$$.sh
+
+# Try to remove key from destination (may fail if no connection)
+ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -i /tmp/transfer-key-$$ $TO_IP \"sed -i '/$KEY_COMMENT/d' ~/.ssh/authorized_keys\" 2>/dev/null || true
+CLEANUP_EOF
+
+chmod +x /tmp/cleanup-transfer-key-$$.sh
+nohup /tmp/cleanup-transfer-key-$$.sh > /dev/null 2>&1 &
+"
+                    
+                    echo "Executing direct transfer with auto-cleanup..."
+                    RSYNC_OPTS="-avz --progress"
+                    if [ "$use_compress" = "true" ]; then
+                        RSYNC_OPTS="$RSYNC_OPTS --compress-level=9"
+                    fi
+                    
+                    # Build SSH options for rsync
+                    rsync_ssh_opts="-i /tmp/transfer-key-$$"
+                    if [ "$TRUST_HOST" = "true" ]; then
+                        rsync_ssh_opts="$rsync_ssh_opts -o StrictHostKeyChecking=no"
+                    fi
+                    
+                    ESCAPED_FILE_RSYNC=$(shell_escape "$FILE")
+                    ESCAPED_DEST_RSYNC=$(shell_escape "$DEST")
+                    ssh -o ControlPath="$FROM_CONTROL" "$FROM_HOST" "
+                        rsync $RSYNC_OPTS -e 'ssh $rsync_ssh_opts' $ESCAPED_FILE_RSYNC \"$TO_IP:$ESCAPED_DEST_RSYNC\"
+                        rm -f /tmp/transfer-key-$$
+                    "
+                    
+                    RESULT=$?
+                    
+                    echo "Cleaning up..."
+                    ssh -o ControlPath="$TO_CONTROL" "$TO_HOST" "sed -i '/$KEY_COMMENT/d' ~/.ssh/authorized_keys"
+                    rm -f "$TEMP_KEY" "$TEMP_KEY.pub"
+                fi
+                ;;
+                
+            "local"|*)
+                echo "[LOCAL MODE] Using local disk as intermediary..."
+                TEMP_FILE="/tmp/remote-transfer-$$"
+                
+                ESCAPED_FILE_LOCAL=$(shell_escape "$FILE")
+                if [ "$use_compress" = "true" ]; then
+                    quiet_echo "[COMPRESS] Downloading with compression..."
+                    rsync -avz --progress --protect-args -e "ssh -o ControlPath=$FROM_CONTROL" "$FROM_HOST:$ESCAPED_FILE_LOCAL" "$TEMP_FILE"
+                else
+                    scp -o ControlPath="$FROM_CONTROL" "$FROM_HOST:$ESCAPED_FILE_LOCAL" "$TEMP_FILE"
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    ESCAPED_DEST_LOCAL=$(shell_escape "$DEST")
+                    if [ "$use_compress" = "true" ]; then
+                        quiet_echo "[COMPRESS] Uploading with compression..."
+                        rsync -avz --progress --protect-args -e "ssh -o ControlPath=$TO_CONTROL" "$TEMP_FILE" "$TO_HOST:$ESCAPED_DEST_LOCAL"
+                    else
+                        scp -o ControlPath="$TO_CONTROL" "$TEMP_FILE" "$TO_HOST:$ESCAPED_DEST_LOCAL"
+                    fi
+                    RESULT=$?
+                    rm -f "$TEMP_FILE"
+                else
+                    RESULT=1
+                fi
+                ;;
+        esac
+        
+        if [ $RESULT -eq 0 ] && [ "$use_verify" = "true" ]; then
+            quiet_echo "[VERIFY] Calculating hashes..."
+            FROM_HASH=$(calculate_hash "$FILE" true "$FROM_CONTROL" "$FROM_HOST")
+            TO_HASH=$(calculate_hash "$DEST" true "$TO_CONTROL" "$TO_HOST")
+            
+            if [ "$FROM_HASH" = "$TO_HASH" ]; then
+                quiet_echo "[VERIFY] OK - Hashes match: ${FROM_HASH:0:16}..."
+            else
+                echo "[VERIFY] ERROR - Hash mismatch!"
+                echo "  Source: $FROM_HASH"
+                echo "  Dest:   $TO_HASH"
+                exit 1
+            fi
+        fi
+        
+        if [ $RESULT -eq 0 ]; then
+            echo "[OK] Transfer complete"
+        else
+            echo "[ERROR] Transfer failed"
+            exit 1
+        fi
+        ;;
+        
+    "close")
+        if [ $# -lt 2 ]; then
+            echo "Usage: remote close <id>"
+            exit 1
+        fi
+        ID="$2"
+        validate_id "$ID"
+        get_session_info "$ID"
+        
+        echo "Closing session [$ID] to $SSH_HOST..."
+        ssh -O exit -o ControlPath="$CONTROL_PATH" "$SSH_HOST"
+        
+        # Clean up control directory if exists
+        if [ -f "$REMOTE_DIR/$ID.controldir" ]; then
+            control_dir=$(cat "$REMOTE_DIR/$ID.controldir" 2>/dev/null)
+            [ -n "$control_dir" ] && rm -rf "$control_dir"
+        fi
+        
+        rm -f "$REMOTE_DIR/$ID.host" "$REMOTE_DIR/$ID.control" "$REMOTE_DIR/$ID.controldir"
+        echo "[OK] Session [$ID] closed"
+        ;;
+        
+    "close-all")
+        echo "Closing all sessions..."
+        for session in "$REMOTE_DIR"/*.host; do
+            if [ -f "$session" ]; then
+                id=$(basename "$session" .host)
+                host=$(cat "$session")
+                control=$(cat "$REMOTE_DIR/$id.control")
+                echo "  Closing [$id] to $host"
+                ssh -O exit -o ControlPath="$control" "$host" 2>/dev/null
+                
+                # Clean up control directory if exists
+                if [ -f "$REMOTE_DIR/$id.controldir" ]; then
+                    control_dir=$(cat "$REMOTE_DIR/$id.controldir" 2>/dev/null)
+                    [ -n "$control_dir" ] && rm -rf "$control_dir"
+                fi
+                
+                rm -f "$REMOTE_DIR/$id.host" "$REMOTE_DIR/$id.control" "$REMOTE_DIR/$id.controldir"
+            fi
+        done
+        echo "[OK] All sessions closed"
+        ;;
+        
+    "save")
+        if [ $# -lt 4 ]; then
+            echo "Usage: remote save <id> <user@host> <password>"
+            exit 1
+        fi
+        ID="$2"
+        validate_id "$ID"
+        SSH_HOST="$3"
+        PASSWORD="$4"
+        
+        # Check sshpass
+        if ! check_sshpass; then
+            exit 1
+        fi
+        
+        quiet_echo "Saving credentials for session [$ID]..."
+        
+        # Test connection first
+        quiet_echo "Testing connection to $SSH_HOST..."
+        # Build test SSH options
+        test_opts="-o ConnectTimeout=10"
+        if [ "$TRUST_HOST" = "true" ]; then
+            test_opts="$test_opts -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        fi
+        SSHPASS="$PASSWORD" sshpass -e ssh $test_opts "$SSH_HOST" "exit" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo "[ERROR] Failed to connect with provided credentials"
+            echo "Please check username, host, and password"
+            exit 1
+        fi
+        
+        # Encrypt and save credentials
+        ENCRYPTED_PASS=$(encrypt_password "$PASSWORD" "$ID")
+        
+        # Save to file with restricted permissions
+        echo "$SSH_HOST" > "$REMOTE_DIR/$ID.creds"
+        echo "$ENCRYPTED_PASS" >> "$REMOTE_DIR/$ID.creds"
+        chmod 600 "$REMOTE_DIR/$ID.creds"
+        
+        echo "[OK] Credentials saved for session [$ID]"
+        echo "Use 'remote open $ID' to connect"
+        ;;
+        
+    "saved")
+        echo "Saved sessions:"
+        found=0
+        for creds in "$REMOTE_DIR"/*.creds; do
+            if [ -f "$creds" ]; then
+                found=1
+                id=$(basename "$creds" .creds)
+                host=$(head -1 "$creds")
+                
+                # Check if session is active
+                if [ -f "$REMOTE_DIR/$id.host" ] && [ -f "$REMOTE_DIR/$id.control" ]; then
+                    control=$(cat "$REMOTE_DIR/$id.control")
+                    ssh -O check -o ControlPath="$control" "$host" 2>/dev/null
+                    if [ $? -eq 0 ]; then
+                        echo "  [$id] -> $host (saved, active)"
+                    else
+                        echo "  [$id] -> $host (saved, disconnected)"
+                    fi
+                else
+                    echo "  [$id] -> $host (saved)"
+                fi
+            fi
+        done
+        if [ $found -eq 0 ]; then
+            echo "  No saved sessions"
+        fi
+        ;;
+        
+    "forget")
+        if [ $# -lt 2 ]; then
+            echo "Usage: remote forget <id>"
+            exit 1
+        fi
+        ID="$2"
+        validate_id "$ID"
+        
+        if [ ! -f "$REMOTE_DIR/$ID.creds" ]; then
+            echo "Error: No saved credentials for session [$ID]"
+            exit 1
+        fi
+        
+        rm -f "$REMOTE_DIR/$ID.creds"
+        echo "[OK] Removed saved credentials for session [$ID]"
+        ;;
+        
+    "progress")
+        if [ $# -lt 2 ]; then
+            echo "Usage: remote progress <list|clean|job-id>"
+            exit 1
+        fi
+        
+        case "${2:-}" in
+            "list")
+                list_jobs
+                ;;
+            "clean")
+                clean_jobs
+                ;;
+            *)
+                show_job_progress "$2"
+                ;;
+        esac
+        ;;
+        
+    *)
+        show_usage
+        ;;
+esac

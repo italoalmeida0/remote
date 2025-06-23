@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+
+# Vim
+*.swp
+*.swo
+*.swn
+.*.sw[a-z]
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# VS Code
+.vscode/
+
+# Testing
+test/
+tests/
+*.test
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.old
+
+# SSH keys (just in case)
+*.key
+*.pem
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
